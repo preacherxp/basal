@@ -3720,7 +3720,8 @@ class MLXBackend(Capable):
     """Apple Silicon (MLX / mlx-lm): the MLX exports (the -MLX-8bit / -MLX-fp4 repositories) or a bf16 Hugging Face
     directory. Same prompts, tokens and letter readout as the PyTorch backends. The shared prefix of a group (both
     option orders of a question; with SOAM every question and order of a request, i.e. the state) is computed once into
-    a KV cache, and the remaining suffixes run as right-padded batches continuing that cache (the default; one batch
+    a KV cache, and the remaining suffixes continue that cache: on a Llama decoder (basal-1.x, 2.x) as one flat
+    forward over their own tokens, without padding (_flat, the default), else as right-padded batches (one batch
     while cutting them by length saves no kernel tile, _batches). With
     packed=True (basal-serve / basal-bench --mlx-packed, opt-in), a group of a Llama decoder (basal-1.x, 2.x) with a
     static RoPE (default, linear, llama3) whose prefix and all suffixes fit in PACK_TOKENS runs instead as one packed
@@ -3764,6 +3765,10 @@ class MLXBackend(Capable):
     # 40.5 ms for 64 rows, 67.2 for 65, 77.6 for 128, 106.7 for 129). A forward costs about 4-5 ms beside its tiles
     TILE, TILE_DENSE = 32, 64
     FORWARD_ROWS = 8
+    # the flat forward (_flat): the most token rows of one (the suffixes of a group, or unrelated prompts), the rows of
+    # a padded batch (TOKEN_BUDGET); more of them go in padded batches (_batches). 0 turns the flat forward off
+    FLAT_ROWS = 8192
+    flat = False  # set at load: a Llama decoder on mlx-lm's forward
     CACHE_BYTES = 2 << 30  # MLX buffer cache limit (and wired headroom above the weights)
     # --prefix-cache: a request whose prompts together run at most PREFIX_SFX[-1] tokens past the template prefix is cut
     # there (server.cut_of); PREFIX_GB is the state-cache budget when only the template prefixes are kept
@@ -3891,6 +3896,14 @@ class MLXBackend(Capable):
         # length in batches of at most TOKEN_BUDGET padded tokens: ten suffixes of ~7k tokens in one float32 forward
         # asked Metal for an 18.7 GB buffer (the attention scores)
         self.alone = bool(what)
+        # the flat forward (_flat) reads the layers of mlx-lm's Llama (basal-1.x, 2.x; no sliding windows); Gemma 4,
+        # Qwen3.5 and --mlx-forward basal keep their forwards
+        from mlx_lm.models import llama
+        self.flat = isinstance(self.lm, llama.Model) and self.lm.model.swa_idx is None and self.fwd is None and not what
+        if self.flat and not self._flat_checked():
+            self.flat = False
+            print("basal: --mode mlx: the flat forward does not give the bits of this mlx-lm's Llama forward; the "
+                  "padded batches are used instead", flush=True)
 
     def _exact_norms(self, md):
         """Qwen3.5: the (1 + w) RMSNorms as transformers computes them, (1 + w) in float32 and the product rounded to
@@ -4261,9 +4274,10 @@ class MLXBackend(Capable):
         return h[mx.array([b for b, r in enumerate(rows) for _ in r[3]]), mx.array([j for r in rows for j in r[3]])]
 
     def _group(self, toks, lids, cut=None):
-        """One group: shared prefix once, then the suffixes in batches of at most max_rows, cut by length where the
-        forwards cost least (_batches; with `alone`, Qwen3.5: sorted by length, at most TOKEN_BUDGET padded tokens per
-        batch). cut: the server's state-cache cut
+        """One group: shared prefix once, then the suffixes over its keys and values: one flat forward of their own
+        tokens (_flat: a Llama decoder, up to FLAT_ROWS tokens), else batches of at most max_rows, cut by length where
+        the forwards cost least (_batches; with `alone`, Qwen3.5: sorted by length, at most TOKEN_BUDGET padded tokens
+        per batch). cut: the server's state-cache cut
         (tokens of the root, which every prompt of the group begins with): the root's keys / values come from the state
         cache (_state) and only the rest of the shared prefix is computed over them; a single prompt runs as
         _cut_single. The cold and the cached request run the same forwards, so a cached state gives bit-identical
@@ -4282,6 +4296,8 @@ class MLXBackend(Capable):
         else:
             prefix = self._prefix(toks[0][:P]) if P > 0 else None
         res, lens = [None] * len(toks), [len(t) - P for t in toks]
+        if self.flat and sum(lens) <= self.FLAT_ROWS:  # (FLAT_ROWS 0: off)
+            return self._letters(self._flat([t[P:] for t in toks], prefix), lids)
         for c in self._chunks(lens) if self.alone else self._batches(lens):
             for j, p in zip(c, self._letters(self._forward([toks[j][P:] for j in c], prefix), [lids[j] for j in c])):
                 res[j] = p
@@ -4335,9 +4351,68 @@ class MLXBackend(Capable):
             j = start[j]
         return out[::-1]
 
+    def _flat_checked(self):
+        """Whether the flat forward computes what mlx-lm's forward does on this model, checked at load where the two
+        run the same rows through every matmul and so must give the same bits: one prompt alone, and two rows of one
+        length over a prefix. A later mlx-lm whose Llama layers do something _flat does not read fails this, and its
+        own forward is used."""
+        mx, n, P, S = self.mx, self.lm.args.vocab_size, 16, 12  # (40 tokens: a few kernel tiles at load)
+        t = [(7919 * i + 13) % n for i in range(P + 2 * S)]
+        pre, rows = self._prefix(t[:P]), [t[P: P + S], t[P + S:]]
+        return bool(mx.array_equal(self._flat([t]), self._forward([t])).item()
+                    and mx.array_equal(self._flat(rows, pre), self._forward(rows, pre)).item())
+
+    def _flat(self, rows, prefix=None):
+        """_forward without the padding: token rows -> the hidden state at each row's last token, in one forward whose
+        linear layers run over the rows' tokens alone. The hidden states are one flat row [1, N, D], every row's tokens
+        one after another, so the norms, the projections and the MLPs of a layer run over N rows, where right-padded
+        batches run rows x the longest row and each batch starts kernel tiles of its own (_batches). Only the
+        attention takes the rows apart, as _forward reads them: for the attention alone they go into right-padded
+        batches (_batches) that continue `prefix` (the keys and values of a shared prefix, as _prefix or the state
+        cache gives them, so a cached state and a computed one give the same bits here too), and each row's own tokens
+        are taken back. The same ops on the same values as mlx-lm's forward: where no padding is saved (one row, or
+        rows of one length) its bits, which the load checks (_flat_checked); where rows differ in length the matmuls
+        run fewer rows, MLX picks their kernels by the row count, and in bf16 and quantised weights the probabilities
+        can move in their last bits against the padded batches."""
+        mx = self.mx
+        m, sdpa = self.lm.model, mx.fast.scaled_dot_product_attention
+        P = prefix[0][0].shape[2] if prefix is not None else 0
+        ids, last, chunks = [], [None] * len(rows), []
+        for c in self._batches(list(map(len, rows)), None if P else self.TOKEN_BUDGET):
+            S = max(len(rows[j]) for j in c)
+            at, own = [], []  # per row of the batch its S places in the flat row (its last token again as padding)
+            for b, j in enumerate(c):
+                n, start = len(rows[j]), len(ids)
+                ids += rows[j]
+                at.append([start + min(t, n - 1) for t in range(S)])
+                own += range(b * S, b * S + n)
+                last[j] = len(ids) - 1
+            chunks.append((mx.array(at), mx.array(own), len(c), S))
+
+        def heads(x, n):  # [B, L, n * d] -> [B, n, L, d]
+            return x.reshape(x.shape[0], x.shape[1], n, -1).transpose(0, 2, 1, 3)
+        h = m.embed_tokens(mx.array([ids]))
+        for i, layer in enumerate(m.layers):
+            a = layer.self_attn
+            x = layer.input_layernorm(h)
+            q, k, v = a.q_proj(x)[0], a.k_proj(x)[0], a.v_proj(x)[0]
+            out = []
+            for at, own, B, S in chunks:
+                qs, ks = a.rope(heads(q[at], a.n_heads), offset=P), a.rope(heads(k[at], a.n_kv_heads), offset=P)
+                vs = heads(v[at], a.n_kv_heads)
+                if P:
+                    ks = mx.concatenate([mx.repeat(prefix[i][0], B, axis=0), ks], axis=2)
+                    vs = mx.concatenate([mx.repeat(prefix[i][1], B, axis=0), vs], axis=2)
+                o = sdpa(qs, ks, vs, scale=a.scale, mask="causal" if S > 1 else None)
+                out.append(o.transpose(0, 2, 1, 3).reshape(B * S, -1)[own])
+            h = h + a.o_proj(mx.concatenate(out)[None])
+            h = h + layer.mlp(layer.post_attention_layernorm(h))
+        return m.norm(h)[0][mx.array(last)]
+
     def _singles(self, toks, lids):
-        """Unrelated prompts: right-padded batches of similar length (_batches), no cache; with `alone` (Qwen3.5) one
-        prompt per forward, each queued (mx.async_eval) while the GPU runs the one before."""
+        """Unrelated prompts: one flat forward per FLAT_ROWS of their tokens, by length (_flat; one prompt, or a longer
+        one, alone in mlx-lm's forward), else right-padded batches of similar length (_batches), no cache; with `alone`
+        (Qwen3.5) one prompt per forward, each queued (mx.async_eval) while the GPU runs the one before."""
         if self.alone:
             hs = []
             for t in toks:
@@ -4345,6 +4420,18 @@ class MLXBackend(Capable):
                 self.mx.async_eval(hs[-1])
             return self._letters(self.mx.concatenate(hs), lids)
         res = [None] * len(toks)
+        if self.flat and self.FLAT_ROWS:
+            cur, n = [], 0
+            for k in [*sorted(range(len(toks)), key=lambda k: len(toks[k])), None]:
+                if cur and (k is None or n + len(toks[k]) > self.FLAT_ROWS):
+                    rows = [toks[j] for j in cur]
+                    h = self._flat(rows) if len(cur) > 1 else self._forward(rows)  # (one prompt: no padding to save)
+                    for j, p in zip(cur, self._letters(h, [lids[j] for j in cur])):
+                        res[j] = p
+                    cur, n = [], 0
+                if k is not None:
+                    cur.append(k); n += len(toks[k])
+            return res
         for c in self._batches([len(t) for t in toks], self.TOKEN_BUDGET):
             for j, p in zip(c, self._letters(self._forward([toks[j] for j in c]), [lids[j] for j in c])):
                 res[j] = p

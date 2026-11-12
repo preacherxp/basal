@@ -156,13 +156,13 @@ def test_mlx_batches_are_the_cheapest_cuts(quantised):
 
 @FORWARDS
 def test_mlx_batches_by_length_equal_torch(tmp_path, forward):
-    """A group whose suffixes differ in length runs as several forwards over the one prefix (_batches; tiles of 2 rows
-    here, so that the tiny group is cut), and unrelated prompts likewise: every readout equals the PyTorch one and
-    comes back at its prompt's place."""
+    """Without the flat forward (FLAT_ROWS 0, or more rows than it takes): a group whose suffixes differ in length runs
+    as several forwards over the one prefix (_batches; tiles of 2 rows here, so that the tiny group is cut), and
+    unrelated prompts likewise: every readout equals the PyTorch one and comes back at its prompt's place."""
     pytest.importorskip("mlx.core")
     m = tiny_llama(tmp_path)
     be = mlx_stub(tmp_path, forward=forward)
-    be.max_rows, be.TILE_DENSE, be.FORWARD_ROWS = 16, 2, 1
+    be.max_rows, be.TILE_DENSE, be.FORWARD_ROWS, be.FLAT_ROWS = 16, 2, 1, 0
     toks = [STATE + [5, 6, 10, 11], STATE + [3], STATE + list(range(7, 19)) * 2, STATE + [5, 6, 11, 10],
             STATE + list(range(7, 13)), STATE + [4]]
     lids = [[10, 11], [10, 11, 12, 13], [10, 11, 12], [10, 11], [12, 13], [10, 15]]
@@ -179,6 +179,85 @@ def test_mlx_batches_by_length_equal_torch(tmp_path, forward):
     got = be.run(singles, sl)
     assert sorted(rows) == [[8], [39, 39], [118]]
     for r, g in zip(reference(m, singles, sl), got):
+        assert max(abs(x - y) for x, y in zip(r, g)) < 2e-4
+
+
+def flat_calls(be):
+    """The token rows of every _flat call (and whether it continues a prefix), and those of every _forward call."""
+    flat, padded = [], []
+    f, g = be._flat, be._forward
+    be._flat = lambda rows, prefix=None: flat.append((sorted(map(len, rows)), prefix is not None)) or f(rows, prefix)
+    be._forward = lambda rows, prefix=None: padded.append(sorted(map(len, rows))) or g(rows, prefix)
+    return flat, padded
+
+
+@pytest.mark.parametrize("quant", [None, "q8"])
+def test_mlx_flat_forward(tmp_path, quant):
+    """A Llama decoder on mlx-lm's forward (the default): the suffixes of a group run as one flat forward over the
+    prefix's keys and values, their tokens one after another without padding (_flat), and unrelated prompts as one
+    flat forward. The readouts equal PyTorch's and the padded batches' (FLAT_ROWS 0), each at its prompt's place; the
+    linear layers of the forward run over the prompts' own tokens, and a prompt alone has the bits of mlx-lm's
+    forward. With 8-bit weights too (MLX picks the matmul kernel by the row count)."""
+    pytest.importorskip("mlx.core")
+    m = tiny_llama(tmp_path)
+    be = mlx_stub(tmp_path, quant)
+    assert be.flat
+    be.max_rows, be.TILE_DENSE, be.TILE, be.FORWARD_ROWS = 16, 2, 2, 1  # the attention's batches are cut: [1, 1], [4, 4], ...
+    tol = 2e-4 if quant is None else 0.05
+    toks = [STATE + [5, 6, 10, 11], STATE + [3], STATE + list(range(7, 19)) * 2, STATE + [5, 6, 11, 10],
+            STATE + list(range(7, 13)), STATE + [4]]
+    lids = [[10, 11], [10, 11, 12, 13], [10, 11, 12], [10, 11], [12, 13], [10, 15]]
+    singles = [list(range(1, 40)), list(range(5, 64)) * 2, [9, 8, 7, 6, 5, 4, 3, 2], list(range(2, 41))]
+    sl = [[10, 11], [12, 13, 14], [10, 15], [11, 12]]
+    flat, padded = flat_calls(be)
+    seen = []  # the rows of the last layer's MLP in each forward
+    down = be.lm.model.layers[-1].mlp.down_proj
+    be.lm.model.layers[-1].mlp.down_proj = lambda x: seen.append(x.shape[:2]) or down(x)
+    got = be.run_shared([(toks, lids)])[0]
+    assert flat == [([1, 1, 4, 4, 6, 24], True)] and padded == []
+    assert seen == [(1, len(STATE)), (1, 40)]  # the prefix, then the 40 tokens after it: no row of padding
+    got_s = be.run(singles, sl)
+    assert flat[1:] == [([8, 39, 39, 118], False)] and padded == [] and seen[2:] == [(1, 204)]
+    for r, g in zip(reference(m, toks, lids) + reference(m, singles, sl), got + got_s):
+        assert max(abs(x - y) for x, y in zip(r, g)) < tol
+    # the flat forward of one prompt has the bits of mlx-lm's forward (which runs a prompt that comes alone)
+    for t, ids in zip(singles, sl):
+        assert be.pool.submit(lambda: be._letters(be._flat([t]), [ids]) == be._letters(be._forward([t]), [ids])).result()
+    # the padded batches (the flat forward off, or a group with more rows than it takes) give the same readouts
+    be.FLAT_ROWS = 39
+    flat.clear(), padded.clear()
+    capped = be.run_shared([(toks, lids)])[0] + be.run(singles, sl)
+    # the group (40 rows after its prefix) in padded batches; at most 39 rows a flat forward: each prompt alone
+    assert padded == [[1, 1], [4, 4], [6], [24], [8], [39], [39], [118]] and flat == []
+    be.FLAT_ROWS = 0
+    off = be.run_shared([(toks, lids)])[0] + be.run(singles, sl)
+    assert flat == []
+    for a, b, c in zip(got + got_s, capped, off):
+        assert max(abs(x - y) for x, y in zip(a, b)) < (1e-5 if quant is None else 0.05)
+        assert max(abs(x - y) for x, y in zip(a, c)) < (1e-5 if quant is None else 0.05)
+
+
+def test_mlx_flat_forward_is_for_llama_on_mlx_lms_forward(tmp_path, monkeypatch, capsys):
+    """Gemma 4 (basal-omni) and --mlx-forward basal keep their own forwards; and a Llama whose flat forward does not
+    give mlx-lm's bits where the two run the same rows (the check at load: a later mlx-lm with other layers) keeps the
+    padded batches, and says so."""
+    pytest.importorskip("mlx.core")
+    m = tiny_llama(tmp_path)
+    for quant in (None, "q8"):
+        be = mlx_stub(tmp_path, quant)
+        assert be.flat and be.pool.submit(be._flat_checked).result()
+    assert not mlx_stub(tmp_path, forward="basal").flat
+    tiny_gemma4(tmp_path / "g4")
+    assert not mlx_stub(tmp_path / "g4").flat
+    capsys.readouterr()
+    flat = MLXBackend._flat
+    monkeypatch.setattr(MLXBackend, "_flat", lambda self, rows, prefix=None: flat(self, rows, prefix) * 1.5)
+    be = mlx_stub(tmp_path)
+    assert not be.flat and "the flat forward does not give the bits" in capsys.readouterr().out
+    padded = flat_calls(be)[1]
+    got = be.run_shared([(TOKS, LIDS)])[0]
+    assert len(padded) >= 1
+    for r, g in zip(reference(m, TOKS, LIDS), got):
         assert max(abs(x - y) for x, y in zip(r, g)) < 2e-4
 
 
