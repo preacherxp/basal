@@ -8,7 +8,7 @@ log behave as in `--mode fast`. Not available in the ports: the evidence output 
 
 | mode | weights | engine | how the letters are read |
 |---|---|---|---|
-| `mlx` | `-MLX-8bit` (affine 8-bit), `-MLX-fp4` (`nvfp4`), or the bf16 repo | MLX / mlx-lm inside the server | output head at the readout positions; the state is computed once into a KV cache, every question and option order continues it in one batch |
+| `mlx` | `-MLX-8bit` (affine 8-bit), `-MLX-fp4` (`nvfp4`), or the bf16 repo | MLX / mlx-lm inside the server | output head at the readout positions; the state is computed once into a KV cache, every question and option order continues it, in batches cut by length |
 | `ollama` | `-GGUF` (`Q8_0`, `Q4_K_M`) | Ollama 0.12.11 or newer (measured: 0.35.0) | `/api/generate`, `raw: true`, one token, `logprobs` + `top_logprobs` (20) |
 | `llamacpp` | `-GGUF` | llama.cpp `llama-server` (measured: 0.5.0, b11146) | `/completion` with the prompt as token ids, `n_probs` (20), log-probabilities of the raw logits |
 
@@ -237,10 +237,10 @@ In such a file the certified confidence thresholds are copied from the bf16 mode
 ## Notes
 
 - **Prefix sharing.** MLX: the longest common token prefix of a request's prompts (system prompt and state; for one
-  question also the question) is computed once, and every suffix continues a copy of that KV cache in one right-padded
-  batch, which is exact (a suffix sees the prefix and its own earlier tokens only; MLX bf16 agrees with PyTorch bf16 on
-  99.8%). Ollama / llama.cpp: the prompts of a request are sent one after another, so the engine's prompt cache reuses
-  the state.
+  question also the question) is computed once, and every suffix continues a copy of that KV cache in right-padded
+  batches (one batch, unless cutting the suffixes by length starts fewer kernel tiles), which is exact (a suffix sees
+  the prefix and its own earlier tokens only; MLX bf16 agrees with PyTorch bf16 on 99.8%). Ollama / llama.cpp: the
+  prompts of a request are sent one after another, so the engine's prompt cache reuses the state.
 - **Memory.** The MLX backend wires its weights and caps MLX's buffer cache at 2 GB. Without the cap the cache grew
   towards the whole recommended working set (17 GB on a 24 GB Mac), one entry per new input shape, and pushed the
   machine into swap. The 4-bit ports fit 8 GB Macs; bf16 needs about 12 GB free.

@@ -2,6 +2,9 @@
 head, grouped KV heads, transformers-5 `rope_parameters`), with a shared prefix (SOAM group), for unrelated prompts and
 with 8-bit weights made at load time (mlx-q8); through mlx-lm's forward (the default) and basal's own
 (basal/mlx_forward.py, --mlx-forward basal)."""
+import itertools
+import random
+
 import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
@@ -84,6 +87,99 @@ def test_mlx_equals_torch(tmp_path, forward):
     mixed = be.run_shared([([singles[0]], [sl[0]]), (TOKS[:2], LIDS[:2])])
     assert max(abs(x - y) for x, y in zip(mixed[0][0], ref_s[0])) < 2e-4
     assert max(abs(x - y) for x, y in zip(mixed[1][1], ref[1])) < 2e-4
+
+
+def batcher(quantised=True, max_rows=16):
+    be = MLXBackend.__new__(MLXBackend)  # _batches reads the row cap and whether the weights are quantised
+    be.max_rows, be.quantization = max_rows, {"group_size": 64, "bits": 8} if quantised else None
+    return be
+
+
+def batch_cost(be, lens, batches):
+    tile = be.TILE if be.quantization else be.TILE_DENSE
+    return sum(be.FORWARD_ROWS + tile * -(-len(b) * max(lens[j] for j in b) // tile) for b in batches)
+
+
+def test_mlx_batches_cut_where_the_tiles_are_fewest():
+    """_batches: the rows of a group (or unrelated prompts) sorted by length and cut into right-padded batches where
+    the forwards start the fewest kernel tiles (32 rows on quantised weights, 64 on dense ones). One batch of all the
+    rows, in their order, stays while no cut saves a tile."""
+    be = batcher()
+    assert be._batches([51, 34]) == [[0, 1]]  # 102 rows are 4 tiles; 51 and 34 alone are 2 + 2 and a second forward
+    assert be._batches([34, 51]) == [[0, 1]]
+    assert be._batches([7]) == [[0]] and be._batches([]) == []
+    # eight questions over one ticket (their tokens after the shared state): 35 tiles as one batch, 17 as four
+    lens = [80, 34, 53, 34, 70, 33, 140, 33]
+    assert -(-8 * 140 // 32) == 35
+    got = be._batches(lens)
+    assert got == [[1, 3, 5, 7], [2], [0, 4], [6]]
+    assert sum(-(-len(b) * max(lens[j] for j in b) // 32) for b in got) == 17
+    # dense weights: tiles of 64 rows, so other cuts (18 tiles of 64 as one batch, 10 as three)
+    dense = batcher(quantised=False)
+    assert dense._batches(lens) == [[1, 3, 5, 7], [0, 2, 4], [6]]
+    assert dense._batches([20, 30]) == [[0, 1]]
+    # at most max_rows rows per batch, every row once, each batch in the rows' order
+    many = [40] * 40
+    got = be._batches(many)
+    assert all(len(b) <= 16 and b == sorted(b) for b in got) and sorted(j for b in got for j in b) == list(range(40))
+    assert batcher(max_rows=3)._batches([9, 9, 9, 9]) == [[0, 1, 2], [3]]
+    # a token budget (unrelated prompts): no batch pads past it, and a row over it runs alone
+    got = be._batches([300, 5000, 310, 9000, 320], budget=8192)
+    assert sorted(map(tuple, got)) == [(0, 2, 4), (1,), (3,)]
+    assert all(len(b) * max([300, 5000, 310, 9000, 320][j] for j in b) <= 8192 or len(b) == 1 for b in got)
+
+
+@pytest.mark.parametrize("quantised", [True, False])
+def test_mlx_batches_are_the_cheapest_cuts(quantised):
+    """Against every way to cut the rows sorted by length into batches of at most max_rows: none costs less."""
+    rng = random.Random(0)
+    be = batcher(quantised, max_rows=4)
+    for _ in range(200):
+        lens = [rng.choice((rng.randrange(1, 40), rng.randrange(1, 400))) for _ in range(rng.randrange(1, 9))]
+        got = be._batches(lens)
+        assert sorted(j for b in got for j in b) == list(range(len(lens)))
+        assert all(len(b) <= 4 for b in got)
+        order = sorted(range(len(lens)), key=lens.__getitem__)
+        best = None
+        for cuts in itertools.product((False, True), repeat=len(lens) - 1):
+            plan, cur = [], [order[0]]
+            for k, cut in zip(order[1:], cuts):
+                if cut:
+                    plan.append(cur); cur = []
+                cur.append(k)
+            plan.append(cur)
+            if all(len(b) <= 4 for b in plan):
+                c = batch_cost(be, lens, plan)
+                best = c if best is None else min(best, c)
+        assert batch_cost(be, lens, got) == best, lens
+
+
+@FORWARDS
+def test_mlx_batches_by_length_equal_torch(tmp_path, forward):
+    """A group whose suffixes differ in length runs as several forwards over the one prefix (_batches; tiles of 2 rows
+    here, so that the tiny group is cut), and unrelated prompts likewise: every readout equals the PyTorch one and
+    comes back at its prompt's place."""
+    pytest.importorskip("mlx.core")
+    m = tiny_llama(tmp_path)
+    be = mlx_stub(tmp_path, forward=forward)
+    be.max_rows, be.TILE_DENSE, be.FORWARD_ROWS = 16, 2, 1
+    toks = [STATE + [5, 6, 10, 11], STATE + [3], STATE + list(range(7, 19)) * 2, STATE + [5, 6, 11, 10],
+            STATE + list(range(7, 13)), STATE + [4]]
+    lids = [[10, 11], [10, 11, 12, 13], [10, 11, 12], [10, 11], [12, 13], [10, 15]]
+    rows = []
+    fwd = be._forward
+    be._forward = lambda r, prefix=None: rows.append(sorted(map(len, r))) or fwd(r, prefix)
+    got = be.run_shared([(toks, lids)])[0]
+    assert sorted(rows) == [[1, 1], [4, 4], [6], [24]]  # four forwards after the prefix, none padded
+    for r, g in zip(reference(m, toks, lids), got):
+        assert max(abs(x - y) for x, y in zip(r, g)) < 2e-4
+    rows.clear()
+    singles = [list(range(1, 40)), list(range(5, 64)) * 2, [9, 8, 7, 6, 5, 4, 3, 2], list(range(2, 41))]
+    sl = [[10, 11], [12, 13, 14], [10, 15], [11, 12]]
+    got = be.run(singles, sl)
+    assert sorted(rows) == [[8], [39, 39], [118]]
+    for r, g in zip(reference(m, singles, sl), got):
+        assert max(abs(x - y) for x, y in zip(r, g)) < 2e-4
 
 
 @FORWARDS

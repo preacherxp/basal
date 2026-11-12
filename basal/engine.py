@@ -3720,7 +3720,8 @@ class MLXBackend(Capable):
     """Apple Silicon (MLX / mlx-lm): the MLX exports (the -MLX-8bit / -MLX-fp4 repositories) or a bf16 Hugging Face
     directory. Same prompts, tokens and letter readout as the PyTorch backends. The shared prefix of a group (both
     option orders of a question; with SOAM every question and order of a request, i.e. the state) is computed once into
-    a KV cache, and the remaining suffixes run as one right-padded batch continuing that cache (the default). With
+    a KV cache, and the remaining suffixes run as right-padded batches continuing that cache (the default; one batch
+    while cutting them by length saves no kernel tile, _batches). With
     packed=True (basal-serve / basal-bench --mlx-packed, opt-in), a group of a Llama decoder (basal-1.x, 2.x) with a
     static RoPE (default, linear, llama3) whose prefix and all suffixes fit in PACK_TOKENS runs instead as one packed
     row (the prefix, then every suffix, with explicit positions and a block mask), several groups per forward; other
@@ -3756,6 +3757,13 @@ class MLXBackend(Capable):
     # about 600 tokens a forward is compute-bound and the packed row's dense mask makes it no faster, M5 Max)
     PACK_BUDGET = 2048  # packed rows x padded length per forward: on an M4 Pro 16 rows of ~250 tokens in one forward
     # (TOKEN_BUDGET) gave 9-11% fewer decisions/s than chunks of 2,048 tokens (44 bench examples, two orders)
+    # what _batches counts a forward by: MLX's matmul kernels compute the rows of a forward (rows x padded length, all
+    # the rows of a batch together) in tiles, and a forward's time follows the tiles it starts, not its rows. Quantised
+    # weights: 32 rows (BM of MLX's qmm_t kernels; basal-2.0-mini-MLX-8bit, M4 Pro: 23.7 ms for 32 rows, 40.9 for 33,
+    # 42.0 for 64, 60.2 for 65, and 19.4 ms a tile up to 1,024 rows). Dense weights: 64 rows (basal-2.0-mini in bf16:
+    # 40.5 ms for 64 rows, 67.2 for 65, 77.6 for 128, 106.7 for 129). A forward costs about 4-5 ms beside its tiles
+    TILE, TILE_DENSE = 32, 64
+    FORWARD_ROWS = 8
     CACHE_BYTES = 2 << 30  # MLX buffer cache limit (and wired headroom above the weights)
     # --prefix-cache: a request whose prompts together run at most PREFIX_SFX[-1] tokens past the template prefix is cut
     # there (server.cut_of); PREFIX_GB is the state-cache budget when only the template prefixes are kept
@@ -4253,8 +4261,9 @@ class MLXBackend(Capable):
         return h[mx.array([b for b, r in enumerate(rows) for _ in r[3]]), mx.array([j for r in rows for j in r[3]])]
 
     def _group(self, toks, lids, cut=None):
-        """One group: shared prefix once, then the suffixes in batches of max_rows (with `alone`, Qwen3.5: sorted by
-        length, at most TOKEN_BUDGET padded tokens per batch). cut: the server's state-cache cut
+        """One group: shared prefix once, then the suffixes in batches of at most max_rows, cut by length where the
+        forwards cost least (_batches; with `alone`, Qwen3.5: sorted by length, at most TOKEN_BUDGET padded tokens per
+        batch). cut: the server's state-cache cut
         (tokens of the root, which every prompt of the group begins with): the root's keys / values come from the state
         cache (_state) and only the rest of the shared prefix is computed over them; a single prompt runs as
         _cut_single. The cold and the cached request run the same forwards, so a cached state gives bit-identical
@@ -4272,17 +4281,11 @@ class MLXBackend(Capable):
                 prefix = self._prefix(toks[0][:P], prefix, P)
         else:
             prefix = self._prefix(toks[0][:P]) if P > 0 else None
-        if self.alone:
-            res = [None] * len(toks)
-            for c in self._chunks([len(t) - P for t in toks]):
-                for j, p in zip(c, self._letters(self._forward([toks[j][P:] for j in c], prefix), [lids[j] for j in c])):
-                    res[j] = p
-            return res
-        out = []
-        for i in range(0, len(toks), self.max_rows):
-            h = self._forward([t[P:] for t in toks[i: i + self.max_rows]], prefix)
-            out += self._letters(h, lids[i: i + self.max_rows])
-        return out
+        res, lens = [None] * len(toks), [len(t) - P for t in toks]
+        for c in self._chunks(lens) if self.alone else self._batches(lens):
+            for j, p in zip(c, self._letters(self._forward([toks[j][P:] for j in c], prefix), [lids[j] for j in c])):
+                res[j] = p
+        return res
 
     def _cut_single(self, toks, lids, cut):
         """A single prompt with a cut, as the uncached path reads it (_singles: one forward of the whole prompt): the
@@ -4307,9 +4310,34 @@ class MLXBackend(Capable):
             cur.append(k)
         return chunks + [cur]
 
+    def _batches(self, lens, budget=None):
+        """Indices of rows of these lengths in right-padded batches of at most max_rows rows (and `budget` padded
+        tokens; a longer row runs alone): the rows sorted by length and cut where the forwards cost least. A forward
+        costs FORWARD_ROWS plus its rows x its longest row, rounded up to whole tiles of TILE rows, since a padding row
+        costs what a prompt's row does: eight questions of 33 to 140 tokens over one state are 35 tiles as one batch
+        and 17 as four. One batch of all the rows is kept while no cut saves a tile, and a batch keeps the rows in
+        their order, so a request the cuts do not help runs the forward it ran before."""
+        order, n = sorted(range(len(lens)), key=lens.__getitem__), len(lens)
+        tile = self.TILE if getattr(self, "quantization", None) else self.TILE_DENSE
+        best, start = [(0, 0)] + [None] * n, [0] * (n + 1)  # (cost, padded rows) of the first j rows; their last cut
+        for j in range(1, n + 1):
+            longest = lens[order[j - 1]]
+            for i in range(j - 1, max(j - self.max_rows, 0) - 1, -1):
+                rows = (j - i) * longest
+                if budget and rows > budget and j - i > 1:
+                    break
+                cost = (best[i][0] + self.FORWARD_ROWS + tile * -(-rows // tile), best[i][1] + rows)
+                if best[j] is None or cost < best[j]:
+                    best[j], start[j] = cost, i
+        out, j = [], n
+        while j:
+            out.append(sorted(order[start[j]: j]))
+            j = start[j]
+        return out[::-1]
+
     def _singles(self, toks, lids):
-        """Unrelated prompts: right-padded batches of similar length, no cache; with `alone` (Qwen3.5) one prompt per
-        forward, each queued (mx.async_eval) while the GPU runs the one before."""
+        """Unrelated prompts: right-padded batches of similar length (_batches), no cache; with `alone` (Qwen3.5) one
+        prompt per forward, each queued (mx.async_eval) while the GPU runs the one before."""
         if self.alone:
             hs = []
             for t in toks:
@@ -4317,7 +4345,7 @@ class MLXBackend(Capable):
                 self.mx.async_eval(hs[-1])
             return self._letters(self.mx.concatenate(hs), lids)
         res = [None] * len(toks)
-        for c in self._chunks([len(t) for t in toks]):
+        for c in self._batches([len(t) for t in toks], self.TOKEN_BUDGET):
             for j, p in zip(c, self._letters(self._forward([toks[j] for j in c]), [lids[j] for j in c])):
                 res[j] = p
         return res
