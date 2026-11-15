@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]  # the fork (preacherxp/basal): every branch push runs the gate, not only main
   pull_request:
 
 permissions:
